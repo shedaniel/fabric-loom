@@ -26,16 +26,22 @@ package net.fabricmc.loom.configuration.providers.minecraft.assets;
 
 import java.io.File;
 import java.io.FileReader;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.net.URL;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
+import com.google.common.base.Stopwatch;
+import com.google.common.hash.Hashing;
+import com.google.common.io.Files;
 import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
 import org.gradle.api.GradleException;
 import org.gradle.api.Project;
 
@@ -63,6 +69,7 @@ public class MinecraftAssetsProvider {
 		}
 
 		File assetsInfo = new File(assets, "indexes" + File.separator + assetIndex.getFabricId(minecraftProvider.getMinecraftVersion()) + ".json");
+		File checksumInfo = new File(assets, "checksum" + File.separator + minecraftProvider.getMinecraftVersion() + ".json");
 
 		if (!assetsInfo.exists() || !Checksum.equals(assetsInfo, assetIndex.sha1)) {
 			project.getLogger().lifecycle(":downloading asset index");
@@ -80,16 +87,27 @@ public class MinecraftAssetsProvider {
 			}
 		}
 
-		project.getLogger().lifecycle(":downloading assets...");
+		Gson gson = new Gson();
+		Map<String, AssetChecksumInfo> checksumInfos = new HashMap<>();
+
+		if (checksumInfo.exists()) {
+			try (FileReader reader = new FileReader(checksumInfo)) {
+				checksumInfos.putAll(gson.fromJson(reader, new TypeToken<Map<String, AssetChecksumInfo>>() {
+				}.getType()));
+			}
+		}
 
 		Deque<ProgressLogger> loggers = new ConcurrentLinkedDeque<>();
 		ExecutorService executor = Executors.newFixedThreadPool(Math.min(10, Math.max(Runtime.getRuntime().availableProcessors() / 2, 1)));
+		int toDownload = 0;
 
 		AssetIndex index;
 
 		try (FileReader fileReader = new FileReader(assetsInfo)) {
-			index = new Gson().fromJson(fileReader, AssetIndex.class);
+			index = gson.fromJson(fileReader, AssetIndex.class);
 		}
+
+		Stopwatch stopwatch = Stopwatch.createStarted();
 
 		Map<String, AssetObject> parent = index.getFileMap();
 
@@ -98,8 +116,18 @@ public class MinecraftAssetsProvider {
 			String sha1 = object.getHash();
 			String filename = "objects" + File.separator + sha1.substring(0, 2) + File.separator + sha1;
 			File file = new File(assets, filename);
+			long localFileLength = !file.exists() ? -1L : file.length();
 
-			if (!file.exists() || !Checksum.equals(file, sha1)) {
+			AssetChecksumInfo localFileChecksum = localFileLength == -1L ? null : checksumInfos.computeIfAbsent(entry.getKey(), path -> {
+				try {
+					return new AssetChecksumInfo(Files.asByteSource(file).hash(Hashing.sha1()).toString(), localFileLength);
+				} catch (IOException e) {
+					e.printStackTrace();
+					return null;
+				}
+			});
+
+			if (localFileChecksum == null || localFileChecksum.length != localFileLength || !localFileChecksum.sha1.equals(sha1)) {
 				if (offline) {
 					if (file.exists()) {
 						project.getLogger().warn("Outdated asset " + entry.getKey());
@@ -107,6 +135,7 @@ public class MinecraftAssetsProvider {
 						throw new GradleException("Asset " + entry.getKey() + " not found at " + file.getAbsolutePath());
 					}
 				} else {
+					toDownload++;
 					executor.execute(() -> {
 						ProgressLogger progressLogger;
 
@@ -135,11 +164,31 @@ public class MinecraftAssetsProvider {
 							throw new RuntimeException("Failed to download: " + assetName, e);
 						}
 
+						try {
+							if (localFileChecksum == null) {
+								checksumInfos.put(entry.getKey(), new AssetChecksumInfo(Files.asByteSource(file).hash(Hashing.sha1()).toString(), file.length()));
+							}
+						} catch (IOException e) {
+							throw new RuntimeException("Failed to save checksum: " + assetName, e);
+						}
+
 						//Give this logger back
 						loggers.add(progressLogger);
 					});
 				}
 			}
+		}
+
+		project.getLogger().info("Took " + stopwatch.stop() + " to iterate " + parent.size() + " asset index.");
+
+		if (toDownload > 0) {
+			project.getLogger().lifecycle(":downloading " + toDownload + " asset" + (toDownload == 1 ? "" : "s") + "...");
+		}
+
+		checksumInfo.getParentFile().mkdirs();
+
+		try (FileWriter writer = new FileWriter(checksumInfo)) {
+			gson.toJson(checksumInfos, writer);
 		}
 
 		//Wait for the assets to all download
@@ -154,5 +203,15 @@ public class MinecraftAssetsProvider {
 		}
 
 		loggers.forEach(ProgressLogger::completed);
+	}
+
+	private static class AssetChecksumInfo {
+		public final String sha1;
+		public long length;
+
+		AssetChecksumInfo(String sha1, long length) {
+			this.sha1 = sha1;
+			this.length = length;
+		}
 	}
 }
